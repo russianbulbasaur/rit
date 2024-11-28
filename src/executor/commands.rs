@@ -1,12 +1,31 @@
 use std::fs;
 use std::fs::File;
-use std::io::{BufWriter, Write, BufReader, Read, BufRead};
+use std::io::{BufWriter, Write, BufReader, Read, BufRead, Cursor};
 use std::path::Path;
+use sha1::{Digest, Sha1};
+use miniz_oxide::deflate::{compress_to_vec_zlib};
+use miniz_oxide::inflate::{decompress_to_vec_zlib};
 
 
 struct Blob{
     size:usize,
     content:Vec<u8>
+}
+
+struct TreeEntry{
+    entry_type:TreeEntryType,
+    hash:String,
+    name:String,
+    mode:u64,
+}
+
+enum TreeEntryType{
+    BLOB,
+    TREE
+}
+
+struct Tree{
+    entries:Vec<TreeEntry>
 }
 
 pub fn init(){
@@ -47,8 +66,10 @@ pub fn hash_object(arguments:Vec<String>){
     let mut source_file = File::open(source).unwrap();
     let mut file_contents = Vec::<u8>::new();
     let n = source_file.read_to_end(&mut file_contents).unwrap();
-
-    let hash = "hashhehe";
+    let mut sha_hash_gen = Sha1::new();
+    sha_hash_gen.update(&file_contents);
+    let output = sha_hash_gen.finalize();
+    let hash = format!("{output:x}");
     let hash_dir = &hash[0..2];
     let hash_dir_path = format!(".git/objects/{hash_dir}");
     fs::create_dir(hash_dir_path).unwrap();
@@ -62,28 +83,137 @@ pub fn hash_object(arguments:Vec<String>){
     println!("{}",hash);
 }
 
-fn read_blob(path:&Path) -> Blob{
-    let blob_file = File::open(path).unwrap();
-    let mut buf_reader = BufReader::new(blob_file);
+
+pub fn ls_tree(arguments:Vec<String>) {
+    let mut name_only = false;
+    let mut file_hash= String::from("");
+    if arguments.len() > 3 {
+        if arguments[2] == "--name-only"{
+            file_hash = arguments[3].clone();
+            name_only = true;
+        }else {
+            println!("Invalid argument {}",arguments[2]);
+        }
+    }else{
+        file_hash = arguments[2].clone();
+    }
+
+    let dir_name = &file_hash[0..2];
+    let file_name = &file_hash[2..];
+    let file_path = format!(".git/objects/{dir_name}/{file_name}");
+    let tree = read_tree(Path::new(&file_path));
+    for entry in tree.entries {
+        if name_only {
+            println!("{}", entry.name);
+        }else{
+            println!("{}   {}   {}",entry.mode,entry.name,entry.hash);
+        }
+    }
+}
+
+
+
+fn read_tree(path:&Path) -> Tree {
+    let mut tree_file = File::open(path).unwrap();
+    let mut n;
+    let mut compressed_tree_file_contents : Vec<u8> = Vec::new();
+    tree_file.read_to_end(&mut compressed_tree_file_contents).unwrap();
+    let decompressed_tree_file_contents = decompress_to_vec_zlib(&compressed_tree_file_contents).unwrap();
+    let file_contents_cursor = Cursor::new(decompressed_tree_file_contents);
+    let mut buf_reader = BufReader::new(file_contents_cursor);
+
+    //marker
     let mut marker_buffer = Vec::<u8>::new();
-    let n = buf_reader.read_until(b' ',&mut marker_buffer).unwrap();
-    marker_buffer.remove(marker_buffer.len()-1);
+    n = buf_reader.read_until(b' ',&mut marker_buffer).unwrap();
+    marker_buffer.remove(n-1);
+    let marker = String::from_utf8(marker_buffer).unwrap();
+    if marker != "tree" {
+        panic!("ls-tree called on a non tree like file");
+    }
+
+
+    //size
     let mut size_buffer = Vec::<u8>::new();
-    let n = buf_reader.read_until(b'\0',&mut size_buffer).unwrap();
-    size_buffer.remove(size_buffer.len()-1);
-    let mut content_buffer = Vec::<u8>::new();
-    let n = buf_reader.read_to_end(&mut content_buffer).unwrap();
+    n = buf_reader.read_until(b'\0',&mut size_buffer).unwrap();
+    size_buffer.remove(n-1); //\0
+    let tree_size = String::from_utf8(size_buffer).unwrap().parse().unwrap();
+
+    //reading entries
+    let mut tree_entries = Vec::<TreeEntry>::new();
+    let mut bytes_read = 0;
+    while bytes_read<tree_size{
+        let mut entry_mode_buffer = Vec::new();
+        n = buf_reader.read_until(b' ',&mut entry_mode_buffer).unwrap();
+        bytes_read += n;
+        entry_mode_buffer.remove(n-1); //empty space
+        let mode = String::from_utf8(entry_mode_buffer).unwrap().parse().unwrap();
+        let mut entry_type : TreeEntryType = TreeEntryType::BLOB;
+        if mode == 40000 {
+            entry_type = TreeEntryType::TREE;
+        }
+
+        let mut name_buffer = Vec::new();
+        n = buf_reader.read_until(b'\0',&mut name_buffer).unwrap();
+        bytes_read += n;
+        name_buffer.remove(n-1); //\0
+        let name = String::from_utf8(name_buffer).unwrap();
+
+        let mut hash_buffer:[u8;20] = [0;20];
+        buf_reader.read_exact(&mut hash_buffer).unwrap();
+        bytes_read += 20;
+        let mut hash = hex::encode(&hash_buffer);
+
+        tree_entries.push(TreeEntry{
+            mode,
+            entry_type,
+            name,
+            hash,
+        });
+    }
+
+    Tree{
+        entries:tree_entries
+    }
+}
+
+
+
+
+fn read_blob(path:&Path) -> Blob{
+    let mut blob_file = File::open(path).unwrap();
+    let mut compressed_file_contents = Vec::<u8>::new();
+    blob_file.read_to_end(&mut compressed_file_contents).unwrap();
+    let decompressed_file_contents = decompress_to_vec_zlib(&compressed_file_contents).unwrap();
+    let mut buf_reader = BufReader::new(Cursor::new(decompressed_file_contents));
+
+    //marker
+    let mut decoded_marker_buffer = Vec::<u8>::new();
+    let n = buf_reader.read_until(b' ',&mut decoded_marker_buffer).unwrap();
+    decoded_marker_buffer.remove(n-1);
+
+
+    //size
+    let mut decoded_size_buffer = Vec::<u8>::new();
+    let n = buf_reader.read_until(b'\0',&mut decoded_size_buffer).unwrap();
+    decoded_size_buffer.remove(n-1);
+
+    //content
+    let mut decoded_content_buffer = Vec::<u8>::new();
+    let n = buf_reader.read_to_end(&mut decoded_content_buffer).unwrap();
     Blob{
-        size : String::from_utf8(size_buffer).unwrap().parse().unwrap(),
-        content: content_buffer
+        size : String::from_utf8(decoded_size_buffer).unwrap().parse().unwrap(),
+        content: decoded_content_buffer
     }
 }
 
 
 fn write_blob(file:File,blob:Blob){
     let mut buf_writer = BufWriter::new(file);
-    buf_writer.write("blob ".as_ref()).unwrap();
-    buf_writer.write(blob.size.to_string().as_ref()).unwrap();
-    buf_writer.write(&[b'\0']).unwrap();
-    buf_writer.write(&blob.content[0..]).unwrap();
+    let mut content_vector = Vec::<u8>::new();
+    content_vector.write("blob ".as_ref()).unwrap();
+    content_vector.write(blob.size.to_string().as_ref()).unwrap();
+    content_vector.write(&[b'\0']).unwrap();
+    content_vector.write(&blob.content[0..]).unwrap();
+    let compressed_content_vector = compress_to_vec_zlib(&content_vector,6);
+    buf_writer.write(&compressed_content_vector).unwrap();
 }

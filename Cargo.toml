@@ -2,3 +2,8 @@
 name = "rit"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+miniz_oxide = "0.8.0"
+sha1 = "0.10.6"
+hex = "0.4.3"
