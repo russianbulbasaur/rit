@@ -1,5 +1,5 @@
 use std::fs;
-use std::fs::File;
+use std::fs::{File, FileType};
 use std::io::{BufWriter, Write, BufReader, Read, BufRead, Cursor};
 use std::path::Path;
 use sha1::{Digest, Sha1};
@@ -57,10 +57,10 @@ pub fn cat_file(arguments:Vec<String>){
 }
 
 
-pub fn hash_object(arguments:Vec<String>){
+pub fn hash_object(arguments:Vec<String>) -> String{
     if arguments[2] != "-w" {
         println!("Invalid {} flag",arguments[2]);
-        return
+        return String::new();
     }
     let source = arguments[3].clone();
     let mut source_file = File::open(source).unwrap();
@@ -81,6 +81,7 @@ pub fn hash_object(arguments:Vec<String>){
         content:file_contents,
     });
     println!("{}",hash);
+    hash
 }
 
 
@@ -111,7 +112,90 @@ pub fn ls_tree(arguments:Vec<String>) {
     }
 }
 
+pub fn write_tree(arguments:Vec<String>,directory:String) -> String{
+    let mut tree_entries = Vec::<TreeEntry>::new();
+    let directory_entries = fs::read_dir(directory).unwrap();
+    for entry in directory_entries{
+        let directory_entry = entry.unwrap();
+        let path = directory_entry.path().into_os_string().into_string().unwrap();
+        let name = directory_entry.file_name().into_string().unwrap();
+        if name == ".git" {
+            continue;
+        }
+        let file_type = directory_entry.file_type().unwrap();
+        if file_type.is_file(){
+            //create a blob
+            let blob_hash = hash_object(
+                vec!["".to_string(),"".to_string(),"-w".to_string(),
+                path]);
+            if blob_hash.is_empty(){
+                continue;
+            }
+            tree_entries.push(
+                TreeEntry{
+                    entry_type:TreeEntryType::BLOB,
+                    hash:blob_hash,
+                    name,
+                    mode:1040000
+                }
+            );
+        }else if file_type.is_dir(){
+            //create a tree and record hash
+            let tree_hash = write_tree(Vec::new(),path);
+            if tree_hash.is_empty(){
+                continue;
+            }
+            tree_entries.push(
+                TreeEntry{
+                    entry_type:TreeEntryType::TREE,
+                    mode:40000,
+                    name,
+                    hash:tree_hash
+                }
+            );
+        }
+    }
+    let tree_hash = write_and_compress_tree_object(tree_entries);
+    tree_hash
+}
 
+
+
+fn write_and_compress_tree_object(entries:Vec<TreeEntry>) -> String{
+    let mut write_buffer = Vec::<u8>::new();
+    let mut n;
+
+    //add entries
+    n = write_buffer.write("tree 20".as_bytes()).unwrap();
+    n = write_buffer.write(&[b'\0']).unwrap();
+
+    for entry in entries{
+        let mode_string = entry.mode.to_string();
+        let name = entry.name;
+        let hash = entry.hash;
+        let to_be_written = format!("{mode_string} {name}");
+        write_buffer.write(to_be_written.as_bytes()).unwrap();
+        write_buffer.write(&[b'\0']).unwrap();
+        write_buffer.write(hash.as_bytes()).unwrap();
+    }
+
+    let mut hasher = Sha1::new();
+    hasher.update(&write_buffer);
+    let hasher_output = hasher.finalize();
+    let hash = format!("{hasher_output:x}");
+
+    let dir_name = &hash[0..2];
+    let file_name = &hash[2..];
+    let dir_path = format!(".git/objects/{dir_name}");
+    fs::create_dir(dir_path).unwrap();
+    let file_path = format!(".git/objects/{dir_name}/{file_name}");
+    let tree_file = File::create(file_path).unwrap();
+    let mut buf_writer = BufWriter::new(tree_file);
+
+    let compressed_tree_contents = compress_to_vec_zlib(&write_buffer,6);
+    buf_writer.write(&compressed_tree_contents).unwrap();
+    hash
+}
 
 fn read_tree(path:&Path) -> Tree {
     let mut tree_file = File::open(path).unwrap();
